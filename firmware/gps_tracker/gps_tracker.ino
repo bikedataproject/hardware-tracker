@@ -21,30 +21,34 @@
 
 // --- Settings ---
 #define GPS_LOG_INTERVAL_MS  5000
-#define MOTION_THRESHOLD     3.0
+#define WAKE_THRESHOLD       2.0   // for waking from sleep — needs real movement
+#define RIDE_THRESHOLD       1.5   // for tracking — vibration keeps ride alive
+#define GPS_SPEED_THRESHOLD  3.0   // km/h — above this means cycling
 #define STOP_TIMEOUT_MS      30000
 #define COOLDOWN_MS          5000
 #define SLEEP_DELAY_MS       120000
-#define SLEEP_CHECK_SEC      30      // wake every 30s to check motion
+#define SLEEP_CHECK_SEC      30
 #define RESET_HOLD_MS        5000
 #define MAX_POINTS           1000
 #define SAVE_EVERY           10
+#define BATCH_SIZE           10
 #define POINTS_FILE          "/points.bin"
 
 // --- BLE UUIDs ---
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHAR_POINT_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define CHAR_BATCH_UUID     "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define CHAR_COUNT_UUID     "8ca20d91-5a20-4d5b-a7f1-7c4e3a1c2b3d"
 #define CHAR_CLEAR_UUID     "9da30e02-6b31-4e6c-b802-8d5f4b2d3c4e"
 #define CHAR_PAIR_UUID      "a1b2c3d4-1234-5678-9abc-def012345678"
 #define CHAR_STATUS_UUID    "b2c3d4e5-2345-6789-abcd-ef0123456789"
 #define CHAR_STATE_UUID     "c3d4e5f6-3456-789a-bcde-f01234567890"
+#define CHAR_SEEK_UUID      "d4e5f607-4567-89ab-cdef-012345678901"
 
 // --- GPS point storage ---
 struct GpsPoint {
   float lat;
   float lng;
-  uint32_t timestamp;
+  uint32_t epoch;  // seconds since 2000-01-01
 };
 
 GpsPoint points[MAX_POINTS];
@@ -52,7 +56,7 @@ int pointCount = 0;
 int sendIndex = 0;
 
 // --- State machine ---
-enum TrackerState { IDLE, TRACKING };
+enum TrackerState { IDLE, ACQUIRING, TRACKING, PAUSED };
 TrackerState state = IDLE;
 
 // --- Encryption ---
@@ -67,7 +71,7 @@ Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
 
 // --- BLE ---
 BLEServer* pServer = NULL;
-BLECharacteristic* pPointChar = NULL;
+BLECharacteristic* pBatchChar = NULL;
 BLECharacteristic* pCountChar = NULL;
 BLECharacteristic* pStatusChar = NULL;
 BLECharacteristic* pStateChar = NULL;
@@ -79,36 +83,48 @@ unsigned long lastMotionTime = 0;
 unsigned long stopTime = 0;
 unsigned long idleStartTime = 0;
 
-// --- Encryption helpers ---
-void toHex(const uint8_t* data, int len, char* out) {
-  for (int i = 0; i < len; i++) {
-    sprintf(out + i * 2, "%02x", data[i]);
+// --- GPS epoch helper ---
+// Returns seconds since 2000-01-01 00:00:00 UTC
+uint32_t gpsToEpoch() {
+  if (!gps.date.isValid() || !gps.time.isValid()) return 0;
+
+  int y = gps.date.year();
+  int m = gps.date.month();
+  int d = gps.date.day();
+  int hh = gps.time.hour();
+  int mm = gps.time.minute();
+  int ss = gps.time.second();
+
+  // Days from 2000-01-01 to given date
+  uint32_t days = 0;
+  for (int i = 2000; i < y; i++) {
+    days += (i % 4 == 0 && (i % 100 != 0 || i % 400 == 0)) ? 366 : 365;
   }
-  out[len * 2] = '\0';
+  static const int mdays[] = {0,31,28,31,30,31,30,31,31,30,31,30,31};
+  for (int i = 1; i < m; i++) {
+    days += mdays[i];
+    if (i == 2 && (y % 4 == 0 && (y % 100 != 0 || y % 400 == 0))) days++;
+  }
+  days += d - 1;
+
+  return days * 86400UL + hh * 3600UL + mm * 60UL + ss;
 }
 
-String encryptString(const char* plaintext) {
-  int len = strlen(plaintext);
+// --- Encryption helpers ---
+void encryptBlock(const uint8_t* input, uint8_t* output, int len) {
   int padLen = ((len / 16) + 1) * 16;
-  uint8_t input[80] = {0};
-  uint8_t output[80] = {0};
-  memcpy(input, plaintext, len);
-
+  uint8_t padded[256] = {0};
+  memcpy(padded, input, len);
   uint8_t padVal = padLen - len;
-  for (int i = len; i < padLen; i++) input[i] = padVal;
+  for (int i = len; i < padLen; i++) padded[i] = padVal;
 
   mbedtls_aes_context aes;
   mbedtls_aes_init(&aes);
   mbedtls_aes_setkey_enc(&aes, encKey, 128);
-
   for (int i = 0; i < padLen; i += 16) {
-    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, input + i, output + i);
+    mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, padded + i, output + i);
   }
   mbedtls_aes_free(&aes);
-
-  char hex[161];
-  toHex(output, padLen, hex);
-  return String(hex);
 }
 
 // --- Flash storage ---
@@ -162,9 +178,8 @@ void checkFactoryReset() {
 // --- Deep sleep (timer-based) ---
 void enterDeepSleep() {
   savePoints();
-  Serial.println(">>> Entering deep sleep. Wakes every 30s to check motion.");
+  Serial.println(">>> Entering deep sleep.");
   Serial.flush();
-
   esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_CHECK_SEC * 1000000ULL);
   esp_deep_sleep_start();
 }
@@ -174,14 +189,13 @@ bool quickMotionCheck() {
   if (!accel.begin()) return false;
   accel.setRange(ADXL345_RANGE_4_G);
   delay(50);
-
   for (int i = 0; i < 20; i++) {
     sensors_event_t ev;
     accel.getEvent(&ev);
     float mag = sqrt(ev.acceleration.x * ev.acceleration.x +
                      ev.acceleration.y * ev.acceleration.y +
                      ev.acceleration.z * ev.acceleration.z);
-    if (abs(mag - 9.8) > MOTION_THRESHOLD) return true;
+    if (abs(mag - 9.8) > WAKE_THRESHOLD) return true;
     delay(100);
   }
   return false;
@@ -192,12 +206,12 @@ class ServerCallbacks : public BLEServerCallbacks {
   void onConnect(BLEServer* pServer) {
     deviceConnected = true;
     idleStartTime = millis();
+    sendIndex = 0;
     Serial.println("BLE: client connected");
   }
   void onDisconnect(BLEServer* pServer) {
     deviceConnected = false;
     idleStartTime = millis();
-    sendIndex = 0;
     Serial.println("BLE: client disconnected");
     pServer->startAdvertising();
   }
@@ -215,7 +229,7 @@ class PairCallbacks : public BLECharacteristicCallbacks {
       prefs.putBytes("key", encKey, 16);
       isPaired = true;
       pStatusChar->setValue("PAIRED");
-      Serial.println("BLE: paired successfully. Restart to update name.");
+      Serial.println("BLE: paired successfully");
     } else {
       Serial.println("BLE: invalid key length");
     }
@@ -225,31 +239,93 @@ class PairCallbacks : public BLECharacteristicCallbacks {
 class ClearCallbacks : public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic* pChar) {
     if (!isPaired) return;
+    // Only allow clear when not tracking
+    if (state == TRACKING) {
+      Serial.println("BLE: clear rejected — still tracking");
+      return;
+    }
     clearPoints();
-    pCountChar->setValue("0");
     Serial.println("BLE: points cleared");
   }
 };
 
-class PointReadCallbacks : public BLECharacteristicCallbacks {
+class SeekCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic* pChar) {
+    if (!isPaired) return;
+    String data = pChar->getValue();
+    int idx = atoi(data.c_str());
+    if (idx >= 0 && idx <= pointCount) {
+      sendIndex = idx;
+      Serial.print("BLE: seek to ");
+      Serial.println(sendIndex);
+    }
+  }
+};
+
+// Batch read: sends up to BATCH_SIZE points as binary, encrypted
+// Format: [2B startIndex] [2B count] then for each point:
+//   Reference (first in batch): [4B lat] [4B lng] [4B epoch] = 12 bytes
+//   Delta (rest):               [2B dlat] [2B dlng] [2B dt]  = 6 bytes
+// Batch of 10: 4 + 12 + 9*6 = 70 bytes plaintext → 80 bytes encrypted
+class BatchReadCallbacks : public BLECharacteristicCallbacks {
   void onRead(BLECharacteristic* pChar) {
     if (!isPaired) {
-      pChar->setValue("LOCKED");
+      uint8_t locked[] = {'L','O','C','K','E','D'};
+      pChar->setValue(locked, 6);
       return;
     }
 
-    if (sendIndex < pointCount) {
-      char buf[64];
-      snprintf(buf, sizeof(buf), "%d,%.6f,%.6f,%lu",
-               sendIndex, points[sendIndex].lat, points[sendIndex].lng, points[sendIndex].timestamp);
-
-      String encrypted = encryptString(buf);
-      pChar->setValue(encrypted.c_str());
-      sendIndex++;
-    } else {
-      pChar->setValue("DONE");
+    if (sendIndex >= pointCount) {
+      uint8_t done[] = {'D','O','N','E'};
+      pChar->setValue(done, 4);
       sendIndex = 0;
+      return;
     }
+
+    // Build batch
+    int batchCount = min(BATCH_SIZE, pointCount - sendIndex);
+    uint8_t buf[256];
+    int pos = 0;
+
+    // Header: start index (2B) + count (2B)
+    buf[pos++] = (sendIndex >> 8) & 0xFF;
+    buf[pos++] = sendIndex & 0xFF;
+    buf[pos++] = (batchCount >> 8) & 0xFF;
+    buf[pos++] = batchCount & 0xFF;
+
+    // Reference point (full)
+    GpsPoint* ref = &points[sendIndex];
+    memcpy(buf + pos, &ref->lat, 4); pos += 4;
+    memcpy(buf + pos, &ref->lng, 4); pos += 4;
+    memcpy(buf + pos, &ref->epoch, 4); pos += 4;
+
+    // Delta points
+    for (int i = 1; i < batchCount; i++) {
+      GpsPoint* prev = &points[sendIndex + i - 1];
+      GpsPoint* cur = &points[sendIndex + i];
+
+      // Delta in 0.000001 degree units (microdegrees)
+      int16_t dlat = (int16_t)((cur->lat - prev->lat) * 1000000.0f);
+      int16_t dlng = (int16_t)((cur->lng - prev->lng) * 1000000.0f);
+      uint16_t dt = (uint16_t)(cur->epoch - prev->epoch);
+
+      memcpy(buf + pos, &dlat, 2); pos += 2;
+      memcpy(buf + pos, &dlng, 2); pos += 2;
+      memcpy(buf + pos, &dt, 2); pos += 2;
+    }
+
+    // Encrypt
+    int encLen = ((pos / 16) + 1) * 16;
+    uint8_t encrypted[256];
+    encryptBlock(buf, encrypted, pos);
+
+    pChar->setValue(encrypted, encLen);
+    sendIndex += batchCount;
+
+    Serial.print("BLE: sent batch ");
+    Serial.print(sendIndex - batchCount);
+    Serial.print("-");
+    Serial.println(sendIndex - 1);
   }
 };
 
@@ -265,21 +341,34 @@ class CountReadCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-bool isMoving() {
+void setState(TrackerState newState) {
+  state = newState;
+  switch (state) {
+    case IDLE:      pStateChar->setValue("IDLE"); break;
+    case ACQUIRING: pStateChar->setValue("ACQUIRING"); break;
+    case TRACKING:  pStateChar->setValue("TRACKING"); break;
+    case PAUSED:    pStateChar->setValue("PAUSED"); break;
+  }
+}
+
+float getMotion() {
   sensors_event_t event;
   accel.getEvent(&event);
   float magnitude = sqrt(event.acceleration.x * event.acceleration.x +
                          event.acceleration.y * event.acceleration.y +
                          event.acceleration.z * event.acceleration.z);
-  return abs(magnitude - 9.8) > MOTION_THRESHOLD;
+  return abs(magnitude - 9.8);
 }
 
 void logPoint() {
   if (gps.satellites.value() == 0 || !gps.location.isValid() || pointCount >= MAX_POINTS) return;
 
+  uint32_t epoch = gpsToEpoch();
+  if (epoch == 0) return;  // no valid time yet
+
   points[pointCount].lat = gps.location.lat();
   points[pointCount].lng = gps.location.lng();
-  points[pointCount].timestamp = millis();
+  points[pointCount].epoch = epoch;
   pointCount++;
 
   Serial.print("[");
@@ -288,6 +377,8 @@ void logPoint() {
   Serial.print(gps.location.lat(), 6);
   Serial.print(" Lng: ");
   Serial.print(gps.location.lng(), 6);
+  Serial.print(" Epoch: ");
+  Serial.print(epoch);
   Serial.print(" Sats: ");
   Serial.println(gps.satellites.value());
 
@@ -299,13 +390,10 @@ void logPoint() {
 
 void setup() {
   Serial.begin(115200);
-
   checkFactoryReset();
 
-  // If woken by timer, quickly check for motion before full boot
   if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
     if (!quickMotionCheck()) {
-      // No motion — go straight back to sleep
       esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_CHECK_SEC * 1000000ULL);
       esp_deep_sleep_start();
     }
@@ -315,7 +403,6 @@ void setup() {
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Wire.begin(ACCEL_SDA, ACCEL_SCL);
 
-  // Init filesystem
   if (!LittleFS.begin(true)) {
     Serial.println("LittleFS failed!");
   }
@@ -324,7 +411,6 @@ void setup() {
   Serial.print(pointCount);
   Serial.println(" points from flash.");
 
-  // Load encryption key
   prefs.begin("tracker", false);
   isPaired = prefs.getBytesLength("key") == 16;
   if (isPaired) {
@@ -340,16 +426,15 @@ void setup() {
   }
   accel.setRange(ADXL345_RANGE_4_G);
 
-  // BLE setup
   const char* bleName = isPaired ? "BikeTracker" : "BikeTracker (Setup)";
   BLEDevice::init(bleName);
   pServer = BLEDevice::createServer();
   pServer->setCallbacks(new ServerCallbacks());
 
-  BLEService* pService = pServer->createService(BLEUUID(SERVICE_UUID), 20);
+  BLEService* pService = pServer->createService(BLEUUID(SERVICE_UUID), 30);
 
-  pPointChar = pService->createCharacteristic(CHAR_POINT_UUID, BLECharacteristic::PROPERTY_READ);
-  pPointChar->setCallbacks(new PointReadCallbacks());
+  pBatchChar = pService->createCharacteristic(CHAR_BATCH_UUID, BLECharacteristic::PROPERTY_READ);
+  pBatchChar->setCallbacks(new BatchReadCallbacks());
 
   pCountChar = pService->createCharacteristic(CHAR_COUNT_UUID, BLECharacteristic::PROPERTY_READ);
   pCountChar->setCallbacks(new CountReadCallbacks());
@@ -359,6 +444,9 @@ void setup() {
 
   BLECharacteristic* pPairChar = pService->createCharacteristic(CHAR_PAIR_UUID, BLECharacteristic::PROPERTY_WRITE);
   pPairChar->setCallbacks(new PairCallbacks());
+
+  BLECharacteristic* pSeekChar = pService->createCharacteristic(CHAR_SEEK_UUID, BLECharacteristic::PROPERTY_WRITE);
+  pSeekChar->setCallbacks(new SeekCallbacks());
 
   pStatusChar = pService->createCharacteristic(CHAR_STATUS_UUID, BLECharacteristic::PROPERTY_READ);
   pStatusChar->setValue(isPaired ? "PAIRED" : "SETUP");
@@ -384,23 +472,53 @@ void loop() {
   }
 
   unsigned long now = millis();
-  bool moving = isMoving();
+  float motion = getMotion();
 
-  if (moving) {
+  bool wakeMoving = motion > WAKE_THRESHOLD;
+  bool accelMoving = motion > RIDE_THRESHOLD;
+
+  // GPS speed-based movement detection
+  bool gpsMoving = false;
+  if (gps.speed.isValid() && gps.speed.kmph() > GPS_SPEED_THRESHOLD) {
+    gpsMoving = true;
+  }
+
+  bool rideMoving = accelMoving || gpsMoving;
+
+  if (rideMoving) {
     lastMotionTime = now;
     idleStartTime = now;
   }
 
+  bool hasFix = gps.location.isValid() && gps.satellites.value() > 0;
+
   switch (state) {
     case IDLE:
-      if (moving && (now - stopTime > COOLDOWN_MS)) {
-        state = TRACKING;
+      if (wakeMoving && (now - stopTime > COOLDOWN_MS)) {
+        if (hasFix) {
+          setState(TRACKING);
+          Serial.println(">>> Motion + GPS fix — tracking");
+        } else {
+          setState(ACQUIRING);
+          Serial.println(">>> Motion detected — acquiring GPS...");
+        }
         idleStartTime = now;
-        pStateChar->setValue("TRACKING");
-        Serial.println(">>> Motion detected — tracking started");
       }
       if (!deviceConnected && (now - idleStartTime > SLEEP_DELAY_MS)) {
         enterDeepSleep();
+      }
+      break;
+
+    case ACQUIRING:
+      if (hasFix) {
+        setState(TRACKING);
+        Serial.println(">>> GPS fix acquired — tracking");
+      }
+      if (!rideMoving && (now - lastMotionTime > STOP_TIMEOUT_MS)) {
+        setState(IDLE);
+        stopTime = now;
+        idleStartTime = now;
+        Serial.println(">>> No fix, stopped moving — idle");
       }
       break;
 
@@ -409,15 +527,29 @@ void loop() {
         logPoint();
         lastLogTime = now;
       }
+      if (!rideMoving) {
+        setState(PAUSED);
+        Serial.println(">>> No motion — paused");
+      }
+      break;
+
+    case PAUSED:
+      if (rideMoving) {
+        if (hasFix) {
+          setState(TRACKING);
+        } else {
+          setState(ACQUIRING);
+        }
+        Serial.println(">>> Motion resumed");
+      }
       if (now - lastMotionTime > STOP_TIMEOUT_MS) {
-        state = IDLE;
+        setState(IDLE);
         stopTime = now;
         idleStartTime = now;
-        pStateChar->setValue("IDLE");
         savePoints();
-        Serial.print(">>> Stopped — ");
+        Serial.print(">>> Ride ended — ");
         Serial.print(pointCount);
-        Serial.println(" points recorded and saved.");
+        Serial.println(" points saved.");
       }
       break;
   }

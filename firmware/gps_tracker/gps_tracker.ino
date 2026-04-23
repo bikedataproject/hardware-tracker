@@ -17,6 +17,7 @@
 #define GPS_TX_PIN  21
 #define ACCEL_SDA   6
 #define ACCEL_SCL   7
+#define ACCEL_INT1  5
 #define BOOT_BUTTON 9
 
 // --- Settings ---
@@ -27,7 +28,7 @@
 #define STOP_TIMEOUT_MS      30000
 #define COOLDOWN_MS          5000
 #define SLEEP_DELAY_MS       120000
-#define SLEEP_CHECK_SEC      30
+#define ACCEL_ACT_THRESHOLD  20    // 20 * 62.5mg = 1.25g for ADXL345 activity interrupt
 #define RESET_HOLD_MS        5000
 #define MAX_POINTS           1000
 #define SAVE_EVERY           10
@@ -175,30 +176,49 @@ void checkFactoryReset() {
   }
 }
 
-// --- Deep sleep (timer-based) ---
+// --- Deep sleep (ADXL345 interrupt) ---
 void enterDeepSleep() {
   savePoints();
-  Serial.println(">>> Entering deep sleep.");
+  Serial.println(">>> Entering deep sleep. Waiting for motion interrupt.");
   Serial.flush();
-  esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_CHECK_SEC * 1000000ULL);
-  esp_deep_sleep_start();
-}
 
-bool quickMotionCheck() {
-  Wire.begin(ACCEL_SDA, ACCEL_SCL);
-  if (!accel.begin()) return false;
-  accel.setRange(ADXL345_RANGE_4_G);
+  // Configure ADXL345 activity interrupt on INT1
+  Wire.beginTransmission(0x53);
+  Wire.write(0x24);  // THRESH_ACT
+  Wire.write(ACCEL_ACT_THRESHOLD);
+  Wire.endTransmission();
+
+  Wire.beginTransmission(0x53);
+  Wire.write(0x27);  // ACT_INACT_CTL
+  Wire.write(0x70);  // activity on X, Y, Z (AC-coupled)
+  Wire.endTransmission();
+
+  Wire.beginTransmission(0x53);
+  Wire.write(0x2E);  // INT_ENABLE
+  Wire.write(0x10);  // enable activity interrupt
+  Wire.endTransmission();
+
+  Wire.beginTransmission(0x53);
+  Wire.write(0x2F);  // INT_MAP
+  Wire.write(0x00);  // map to INT1 pin
+  Wire.endTransmission();
+
+  // Clear any pending interrupt
+  Wire.beginTransmission(0x53);
+  Wire.write(0x30);  // INT_SOURCE
+  Wire.endTransmission();
+  Wire.requestFrom(0x53, 1);
+  if (Wire.available()) Wire.read();
+
+  // Small delay to let interrupt line settle
   delay(50);
-  for (int i = 0; i < 20; i++) {
-    sensors_event_t ev;
-    accel.getEvent(&ev);
-    float mag = sqrt(ev.acceleration.x * ev.acceleration.x +
-                     ev.acceleration.y * ev.acceleration.y +
-                     ev.acceleration.z * ev.acceleration.z);
-    if (abs(mag - 9.8) > WAKE_THRESHOLD) return true;
-    delay(100);
-  }
-  return false;
+
+  // Pull-down on INT1 to prevent floating
+  gpio_pulldown_en((gpio_num_t)ACCEL_INT1);
+  gpio_pullup_dis((gpio_num_t)ACCEL_INT1);
+
+  esp_deep_sleep_enable_gpio_wakeup(1 << ACCEL_INT1, ESP_GPIO_WAKEUP_GPIO_HIGH);
+  esp_deep_sleep_start();
 }
 
 // --- BLE callbacks ---
@@ -392,12 +412,8 @@ void setup() {
   Serial.begin(115200);
   checkFactoryReset();
 
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_TIMER) {
-    if (!quickMotionCheck()) {
-      esp_sleep_enable_timer_wakeup((uint64_t)SLEEP_CHECK_SEC * 1000000ULL);
-      esp_deep_sleep_start();
-    }
-    Serial.println("Timer wake — motion detected, full boot");
+  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+    Serial.println("Woke from motion interrupt");
   }
 
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);

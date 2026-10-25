@@ -208,17 +208,28 @@ void factoryReset() {
   ESP.restart();
 }
 
-void checkFactoryReset() {
-  pinMode(BOOT_BUTTON, INPUT_PULLUP);
+// Factory reset: hold BOOT for RESET_HOLD_MS during normal operation.
+//
+// This used to run only in setup(), which made it IMPOSSIBLE to trigger: GPIO9 is the
+// ESP32-C3 bootloader strap, so holding it across a reset puts the chip into ROM download
+// mode and the sketch never runs at all. The only window was pressing BOOT in the few
+// milliseconds after a reset but before setup() read it — not a procedure anyone can
+// perform reliably.
+//
+// Polling in loop() avoids the strap entirely: GPIO9 is only special at reset, and reading
+// it during normal operation is fine. It also works on a sealed device, where RESET may not
+// be reachable.
+void pollFactoryReset() {
+  static unsigned long heldSince = 0;
   if (digitalRead(BOOT_BUTTON) == LOW) {
-    Serial.println("BOOT button held — hold 5 seconds for factory reset");
-    unsigned long start = millis();
-    while (digitalRead(BOOT_BUTTON) == LOW) {
-      if (millis() - start > RESET_HOLD_MS) {
-        factoryReset();
-      }
+    if (heldSince == 0) {
+      heldSince = millis();
+      Serial.println("BOOT held — keep holding for factory reset...");
+    } else if (millis() - heldSince > RESET_HOLD_MS) {
+      factoryReset();
     }
-    Serial.println("Released too early — no reset");
+  } else {
+    heldSince = 0;
   }
 }
 
@@ -456,6 +467,12 @@ void setState(TrackerState newState) {
 }
 
 float getMotion() {
+  // Without this guard a missing/failed ADXL345 reads as zeros, so |0 - 9.8| = 9.8 clears
+  // both WAKE_THRESHOLD and RIDE_THRESHOLD — the device believes it is permanently moving,
+  // never returns to IDLE, and so never brings BLE back up. It then sits awake and
+  // unreachable until the battery dies. Reporting "no motion" instead keeps it idle,
+  // advertising and syncable, which is the right failure mode.
+  if (!accelOk) return 0.0f;
   sensors_event_t event;
   accel.getEvent(&event);
   float magnitude = sqrt(event.acceleration.x * event.acceleration.x +
@@ -595,7 +612,7 @@ void setup() {
     while (!Serial && millis() < 600) delay(10);
   }
 
-  checkFactoryReset();
+  pinMode(BOOT_BUTTON, INPUT_PULLUP);
 
   if (wakeCause == ESP_SLEEP_WAKEUP_GPIO) {
     Serial.println("Woke from motion interrupt");
@@ -654,6 +671,8 @@ void loop() {
   while (gpsSerial.available()) {
     gps.encode(gpsSerial.read());
   }
+
+  pollFactoryReset();
 
   unsigned long now = millis();
 

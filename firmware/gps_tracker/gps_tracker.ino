@@ -3,10 +3,10 @@
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_ADXL345_U.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+// NimBLE replaces Bluedroid: its deinit() frees the service/characteristic objects, which
+// makes it safe to tear the BLE stack down during TRACKING — worth ~25 mA, measured. The
+// Bluedroid library leaks ~2-4 KB per cycle and would exhaust the heap within weeks.
+#include <NimBLEDevice.h>
 #include <LittleFS.h>
 #include <Preferences.h>
 #include <mbedtls/aes.h>
@@ -71,11 +71,11 @@ TinyGPSPlus gps;
 Adafruit_ADXL345_Unified accel = Adafruit_ADXL345_Unified(12345);
 
 // --- BLE ---
-BLEServer* pServer = NULL;
-BLECharacteristic* pBatchChar = NULL;
-BLECharacteristic* pCountChar = NULL;
-BLECharacteristic* pStatusChar = NULL;
-BLECharacteristic* pStateChar = NULL;
+NimBLEServer* pServer = NULL;
+NimBLECharacteristic* pBatchChar = NULL;
+NimBLECharacteristic* pCountChar = NULL;
+NimBLECharacteristic* pStatusChar = NULL;
+NimBLECharacteristic* pStateChar = NULL;
 bool deviceConnected = false;
 
 // --- Timers ---
@@ -222,14 +222,14 @@ void enterDeepSleep() {
 }
 
 // --- BLE callbacks ---
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) {
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     deviceConnected = true;
     idleStartTime = millis();
     sendIndex = 0;
     Serial.println("BLE: client connected");
   }
-  void onDisconnect(BLEServer* pServer) {
+  void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     deviceConnected = false;
     idleStartTime = millis();
     Serial.println("BLE: client disconnected");
@@ -237,15 +237,19 @@ class ServerCallbacks : public BLEServerCallbacks {
   }
 };
 
-class PairCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pChar) {
+class PairCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     if (isPaired) {
       Serial.println("BLE: already paired, ignoring");
       return;
     }
-    String data = pChar->getValue();
+    // Read as raw bytes, NOT into an Arduino String. A String is null-terminated, so a
+    // random 16-byte key containing a 0x00 byte would be truncated and rejected as "invalid
+    // key length" — ~6% of keys (1 - (255/256)^16), failing intermittently and
+    // inexplicably.
+    NimBLEAttValue data = pChar->getValue();
     if (data.length() == 16) {
-      memcpy(encKey, (const uint8_t*)data.c_str(), 16);
+      memcpy(encKey, data.data(), 16);
       prefs.putBytes("key", encKey, 16);
       isPaired = true;
       pStatusChar->setValue("PAIRED");
@@ -256,8 +260,8 @@ class PairCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-class ClearCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pChar) {
+class ClearCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     if (!isPaired) return;
     // Only allow clear when not tracking
     if (state == TRACKING) {
@@ -269,8 +273,8 @@ class ClearCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-class SeekCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pChar) {
+class SeekCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     if (!isPaired) return;
     String data = pChar->getValue();
     int idx = atoi(data.c_str());
@@ -287,8 +291,8 @@ class SeekCallbacks : public BLECharacteristicCallbacks {
 //   Reference (first in batch): [4B lat] [4B lng] [4B epoch] = 12 bytes
 //   Delta (rest):               [2B dlat] [2B dlng] [2B dt]  = 6 bytes
 // Batch of 10: 4 + 12 + 9*6 = 70 bytes plaintext → 80 bytes encrypted
-class BatchReadCallbacks : public BLECharacteristicCallbacks {
-  void onRead(BLECharacteristic* pChar) {
+class BatchReadCallbacks : public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     if (!isPaired) {
       uint8_t locked[] = {'L','O','C','K','E','D'};
       pChar->setValue(locked, 6);
@@ -349,8 +353,8 @@ class BatchReadCallbacks : public BLECharacteristicCallbacks {
   }
 };
 
-class CountReadCallbacks : public BLECharacteristicCallbacks {
-  void onRead(BLECharacteristic* pChar) {
+class CountReadCallbacks : public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
     if (!isPaired) {
       pChar->setValue("LOCKED");
       return;
@@ -408,6 +412,17 @@ void logPoint() {
   }
 }
 
+// Static callback instances. NimBLECharacteristic::setCallbacks() does NOT take ownership,
+// so heap-allocating these would leak on every BLE rebuild once the stack is cycled during
+// TRACKING. NimBLEServer::setCallbacks() DOES take ownership by default — hence the explicit
+// false below, or it would call delete on a static and corrupt the heap.
+static ServerCallbacks     cbServer;
+static BatchReadCallbacks  cbBatch;
+static CountReadCallbacks  cbCount;
+static ClearCallbacks      cbClear;
+static PairCallbacks       cbPair;
+static SeekCallbacks       cbSeek;
+
 void setup() {
   Serial.begin(115200);
   checkFactoryReset();
@@ -443,31 +458,31 @@ void setup() {
   accel.setRange(ADXL345_RANGE_4_G);
 
   const char* bleName = isPaired ? "BikeTracker" : "BikeTracker (Setup)";
-  BLEDevice::init(bleName);
-  pServer = BLEDevice::createServer();
-  pServer->setCallbacks(new ServerCallbacks());
+  NimBLEDevice::init(bleName);
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(&cbServer, false);
 
-  BLEService* pService = pServer->createService(BLEUUID(SERVICE_UUID), 30);
+  NimBLEService* pService = pServer->createService(NimBLEUUID(SERVICE_UUID));
 
-  pBatchChar = pService->createCharacteristic(CHAR_BATCH_UUID, BLECharacteristic::PROPERTY_READ);
-  pBatchChar->setCallbacks(new BatchReadCallbacks());
+  pBatchChar = pService->createCharacteristic(CHAR_BATCH_UUID, NIMBLE_PROPERTY::READ);
+  pBatchChar->setCallbacks(&cbBatch);
 
-  pCountChar = pService->createCharacteristic(CHAR_COUNT_UUID, BLECharacteristic::PROPERTY_READ);
-  pCountChar->setCallbacks(new CountReadCallbacks());
+  pCountChar = pService->createCharacteristic(CHAR_COUNT_UUID, NIMBLE_PROPERTY::READ);
+  pCountChar->setCallbacks(&cbCount);
 
-  BLECharacteristic* pClearChar = pService->createCharacteristic(CHAR_CLEAR_UUID, BLECharacteristic::PROPERTY_WRITE);
-  pClearChar->setCallbacks(new ClearCallbacks());
+  NimBLECharacteristic* pClearChar = pService->createCharacteristic(CHAR_CLEAR_UUID, NIMBLE_PROPERTY::WRITE);
+  pClearChar->setCallbacks(&cbClear);
 
-  BLECharacteristic* pPairChar = pService->createCharacteristic(CHAR_PAIR_UUID, BLECharacteristic::PROPERTY_WRITE);
-  pPairChar->setCallbacks(new PairCallbacks());
+  NimBLECharacteristic* pPairChar = pService->createCharacteristic(CHAR_PAIR_UUID, NIMBLE_PROPERTY::WRITE);
+  pPairChar->setCallbacks(&cbPair);
 
-  BLECharacteristic* pSeekChar = pService->createCharacteristic(CHAR_SEEK_UUID, BLECharacteristic::PROPERTY_WRITE);
-  pSeekChar->setCallbacks(new SeekCallbacks());
+  NimBLECharacteristic* pSeekChar = pService->createCharacteristic(CHAR_SEEK_UUID, NIMBLE_PROPERTY::WRITE);
+  pSeekChar->setCallbacks(&cbSeek);
 
-  pStatusChar = pService->createCharacteristic(CHAR_STATUS_UUID, BLECharacteristic::PROPERTY_READ);
+  pStatusChar = pService->createCharacteristic(CHAR_STATUS_UUID, NIMBLE_PROPERTY::READ);
   pStatusChar->setValue(isPaired ? "PAIRED" : "SETUP");
 
-  pStateChar = pService->createCharacteristic(CHAR_STATE_UUID, BLECharacteristic::PROPERTY_READ);
+  pStateChar = pService->createCharacteristic(CHAR_STATE_UUID, NIMBLE_PROPERTY::READ);
   pStateChar->setValue("IDLE");
 
   pService->start();

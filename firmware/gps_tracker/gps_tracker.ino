@@ -55,6 +55,19 @@
                                      // tuned for fast discovery and costly: slowing it
                                      // measured ~6.5 mA.
 #define GPS_RX_BUFFER        1024
+
+// Periodic BLE sync window while riding. 30 s every 10 min is 5% duty, ~1.25 mA on top of
+// 48 — so it keeps nearly all of the 24 mA saving while removing the single point of
+// failure in the sync path. The post-ride window is only SLEEP_DELAY_MS long and Android
+// background BLE scanning is unreliable (doze, app kills, scan throttling); miss it and the
+// device sleeps until the next motion.
+#define BLE_WINDOW_INTERVAL_MS  600000UL
+#define BLE_WINDOW_DURATION_MS  30000UL
+
+// A connected client BLOCKS deep sleep, so an app that holds the link open — or crashes
+// with it open — pins the device at ~73 mA and flattens the pack in ~1.5 days. Stop
+// honouring the block after this long rather than trusting the client.
+#define MAX_CONN_SECONDS        600UL
 #define POINTS_FILE          "/points.bin"
 
 // --- BLE UUIDs ---
@@ -100,6 +113,16 @@ NimBLECharacteristic* pStatusChar = NULL;
 NimBLECharacteristic* pStateChar = NULL;
 bool deviceConnected = false;
 bool accelOk = false;            // false => ADXL345 missing; motion wake unavailable
+NimBLEAdvertising* pAdv = NULL;
+bool bleUp = false;              // is the BLE stack currently initialised?
+
+// Keep BLE up for the whole ride so the app can show live state. Costs the full ~24 mA
+// (tracking 48 -> 73 mA), so OFF by default and treated as a user preference. Persisted in
+// NVS key "live" so the app can enable it later without a firmware change.
+bool liveTracking = false;
+unsigned long bleWindowStart  = 0;
+unsigned long nextBleWindowAt = 0;
+unsigned long bleConnectMs    = 0;  // millis() when the current connection opened
 
 // --- Timers ---
 unsigned long lastLogTime = 0;
@@ -249,15 +272,19 @@ void enterDeepSleep() {
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
     deviceConnected = true;
+    bleConnectMs = millis();
     idleStartTime = millis();
     sendIndex = 0;
     Serial.println("BLE: client connected");
   }
   void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
     deviceConnected = false;
+    bleConnectMs = 0;
     idleStartTime = millis();
     Serial.println("BLE: client disconnected");
-    pServer->startAdvertising();
+    // Guarded: stopBle() tears the stack down while a client may still be attached, which
+    // fires this callback mid-deinit. Touching pServer then would use freed memory.
+    if (bleUp && state == IDLE) pServer->startAdvertising();
   }
 };
 
@@ -404,21 +431,26 @@ void setState(TrackerState newState) {
   switch (state) {
     case IDLE:
       gpsPower(false);
-      pStateChar->setValue("IDLE");
+      startBle();                  // back up so the app can sync after the ride
+      if (pStateChar) pStateChar->setValue("IDLE");
       break;
     case ACQUIRING:
       gpsPower(true);
-      pStateChar->setValue("ACQUIRING");
+      if (!liveTracking) {
+        stopBle();                 // recovers the controller's ~24 mA for the whole ride
+        nextBleWindowAt = millis() + BLE_WINDOW_INTERVAL_MS;
+      }
+      if (pStateChar) pStateChar->setValue("ACQUIRING");
       break;
     case TRACKING:
       gpsPower(true);   // already on via ACQUIRING; idempotent and cheap
-      pStateChar->setValue("TRACKING");
+      if (pStateChar) pStateChar->setValue("TRACKING");
       break;
     case PAUSED:
       // Stay powered: PAUSED is a stop within a ride, and re-acquiring from cold would
       // cost 5-41 s of TTFF producing nothing.
       gpsPower(true);
-      pStateChar->setValue("PAUSED");
+      if (pStateChar) pStateChar->setValue("PAUSED");
       break;
   }
 }
@@ -471,6 +503,77 @@ static ClearCallbacks      cbClear;
 static PairCallbacks       cbPair;
 static SeekCallbacks       cbSeek;
 
+// --- BLE bring-up / tear-down ---
+// The BLE controller costs ~24 mA of the 73 mA tracking total — measured by subtraction
+// against a build with BLE never initialised. Neither light sleep nor stopping advertising
+// recovers any of it (both tested: the meter did not move), because the cost is the
+// controller sitting radio-ready, not the advertising packets. Only a full teardown works.
+//
+// Safe to cycle only on NimBLE: Bluedroid's deinit() left services, characteristics and
+// callbacks allocated, leaking ~2-4 KB per ride.
+void startBle() {
+  if (bleUp) return;
+
+  const char* bleName = isPaired ? "BikeTracker" : "BikeTracker (Setup)";
+  NimBLEDevice::init(bleName);
+  pServer = NimBLEDevice::createServer();
+  pServer->setCallbacks(&cbServer, false);   // false: do not delete a static
+
+  NimBLEService* pService = pServer->createService(NimBLEUUID(SERVICE_UUID));
+
+  pBatchChar = pService->createCharacteristic(CHAR_BATCH_UUID, NIMBLE_PROPERTY::READ);
+  pBatchChar->setCallbacks(&cbBatch);
+
+  pCountChar = pService->createCharacteristic(CHAR_COUNT_UUID, NIMBLE_PROPERTY::READ);
+  pCountChar->setCallbacks(&cbCount);
+
+  NimBLECharacteristic* pClearChar = pService->createCharacteristic(CHAR_CLEAR_UUID, NIMBLE_PROPERTY::WRITE);
+  pClearChar->setCallbacks(&cbClear);
+
+  NimBLECharacteristic* pPairChar = pService->createCharacteristic(CHAR_PAIR_UUID, NIMBLE_PROPERTY::WRITE);
+  pPairChar->setCallbacks(&cbPair);
+
+  NimBLECharacteristic* pSeekChar = pService->createCharacteristic(CHAR_SEEK_UUID, NIMBLE_PROPERTY::WRITE);
+  pSeekChar->setCallbacks(&cbSeek);
+
+  pStatusChar = pService->createCharacteristic(CHAR_STATUS_UUID, NIMBLE_PROPERTY::READ);
+  pStatusChar->setValue(isPaired ? "PAIRED" : "SETUP");
+
+  pStateChar = pService->createCharacteristic(CHAR_STATE_UUID, NIMBLE_PROPERTY::READ);
+  switch (state) {
+    case IDLE:      pStateChar->setValue("IDLE");      break;
+    case ACQUIRING: pStateChar->setValue("ACQUIRING"); break;
+    case TRACKING:  pStateChar->setValue("TRACKING");  break;
+    case PAUSED:    pStateChar->setValue("PAUSED");    break;
+  }
+
+  pService->start();
+  pAdv = pServer->getAdvertising();
+  pAdv->setMinInterval(ADV_INTERVAL_MIN);
+  pAdv->setMaxInterval(ADV_INTERVAL_MAX);
+  // Set the name explicitly: the app discovers BY NAME, so omitting it from the
+  // advertisement would be a silent, total break.
+  pAdv->setName(bleName);
+  pAdv->start();
+
+  bleUp = true;
+  Serial.print("BLE up as '");
+  Serial.print(bleName);
+  Serial.print("' heap=");
+  Serial.println(ESP.getFreeHeap());
+}
+
+void stopBle() {
+  if (!bleUp) return;
+  NimBLEDevice::deinit(true);   // also deletes the server, services and characteristics
+  pServer = NULL;  pAdv = NULL;
+  pBatchChar = pCountChar = pStatusChar = pStateChar = NULL;
+  deviceConnected = false;
+  bleUp = false;
+  Serial.print("BLE down, heap=");
+  Serial.println(ESP.getFreeHeap());
+}
+
 void setup() {
   // Before any peripheral init — changing the clock later would corrupt UART baud
   // dividers. Roughly halves CPU current. Do NOT go below 80 MHz: the BLE controller
@@ -511,6 +614,7 @@ void setup() {
   Serial.println(" points from flash.");
 
   prefs.begin("tracker", false);
+  liveTracking = prefs.getBool("live", false);   // user preference, default off
   isPaired = prefs.getBytesLength("key") == 16;
   if (isPaired) {
     prefs.getBytes("key", encKey, 16);
@@ -539,46 +643,7 @@ void setup() {
     Serial.println("No ADXL345 detected! Motion wake unavailable — timer wake only.");
   }
 
-  const char* bleName = isPaired ? "BikeTracker" : "BikeTracker (Setup)";
-  NimBLEDevice::init(bleName);
-  pServer = NimBLEDevice::createServer();
-  pServer->setCallbacks(&cbServer, false);
-
-  NimBLEService* pService = pServer->createService(NimBLEUUID(SERVICE_UUID));
-
-  pBatchChar = pService->createCharacteristic(CHAR_BATCH_UUID, NIMBLE_PROPERTY::READ);
-  pBatchChar->setCallbacks(&cbBatch);
-
-  pCountChar = pService->createCharacteristic(CHAR_COUNT_UUID, NIMBLE_PROPERTY::READ);
-  pCountChar->setCallbacks(&cbCount);
-
-  NimBLECharacteristic* pClearChar = pService->createCharacteristic(CHAR_CLEAR_UUID, NIMBLE_PROPERTY::WRITE);
-  pClearChar->setCallbacks(&cbClear);
-
-  NimBLECharacteristic* pPairChar = pService->createCharacteristic(CHAR_PAIR_UUID, NIMBLE_PROPERTY::WRITE);
-  pPairChar->setCallbacks(&cbPair);
-
-  NimBLECharacteristic* pSeekChar = pService->createCharacteristic(CHAR_SEEK_UUID, NIMBLE_PROPERTY::WRITE);
-  pSeekChar->setCallbacks(&cbSeek);
-
-  pStatusChar = pService->createCharacteristic(CHAR_STATUS_UUID, NIMBLE_PROPERTY::READ);
-  pStatusChar->setValue(isPaired ? "PAIRED" : "SETUP");
-
-  pStateChar = pService->createCharacteristic(CHAR_STATE_UUID, NIMBLE_PROPERTY::READ);
-  pStateChar->setValue("IDLE");
-
-  pService->start();
-  NimBLEAdvertising* pAdv = pServer->getAdvertising();
-  pAdv->setMinInterval(ADV_INTERVAL_MIN);
-  pAdv->setMaxInterval(ADV_INTERVAL_MAX);
-  // Set the name explicitly: the app discovers BY NAME, so omitting it from the
-  // advertisement would be a silent, total break.
-  pAdv->setName(bleName);
-  pAdv->start();
-
-  Serial.print("BLE advertising as '");
-  Serial.print(bleName);
-  Serial.println("'");
+  startBle();
   Serial.println("Waiting for motion...");
 
   lastMotionTime = millis();
@@ -621,6 +686,24 @@ void loop() {
 
   bool hasFix = gps.location.isValid() && gps.satellites.value() > 0;
 
+  // Periodic BLE sync window while riding: repeated chances for the app to find the device
+  // mid-ride, rather than depending solely on the post-ride window.
+  if (!liveTracking && state != IDLE) {
+    if (!bleUp && (long)(now - nextBleWindowAt) >= 0) {
+      startBle();
+      bleWindowStart = now;
+      Serial.println("BLE: sync window open");
+    } else if (bleUp && (now - bleWindowStart > BLE_WINDOW_DURATION_MS)) {
+      // Never tear down mid-transfer: a connected client is syncing, and closing the stack
+      // under it would abort the download. Defer until it disconnects.
+      if (!deviceConnected) {
+        stopBle();
+        nextBleWindowAt = now + BLE_WINDOW_INTERVAL_MS;
+        Serial.println("BLE: sync window closed");
+      }
+    }
+  }
+
   switch (state) {
     case IDLE:
       if (wakeMoving && (now - stopTime > COOLDOWN_MS)) {
@@ -633,8 +716,16 @@ void loop() {
         }
         idleStartTime = now;
       }
-      if (!deviceConnected && (now - idleStartTime > SLEEP_DELAY_MS)) {
-        enterDeepSleep();
+      // A connected client normally blocks sleep so a sync is never cut off. Stop honouring
+      // that past MAX_CONN_SECONDS, or a client that never disconnects keeps the device
+      // awake at ~73 mA until the pack is flat. Deep sleep drops the link.
+      {
+        bool connStale = deviceConnected && bleConnectMs &&
+                         ((now - bleConnectMs) / 1000UL > MAX_CONN_SECONDS);
+        if (connStale) Serial.println("BLE: connection held too long — sleeping anyway");
+        if ((!deviceConnected || connStale) && (now - idleStartTime > SLEEP_DELAY_MS)) {
+          enterDeepSleep();
+        }
       }
       break;
 

@@ -38,6 +38,9 @@ CHAR_PAIR    = "a1b2c3d4-1234-5678-9abc-def012345678"
 CHAR_STATUS  = "b2c3d4e5-2345-6789-abcd-ef0123456789"
 CHAR_STATE   = "c3d4e5f6-3456-789a-bcde-f01234567890"
 CHAR_SEEK    = "d4e5f607-4567-89ab-cdef-012345678901"
+CHAR_PWR     = "f6a7b8c9-6789-abcd-ef01-234567890123"
+CHAR_LOG     = "a7b8c9da-789a-bcde-f012-345678901234"
+CHAR_BATT    = "c9dae1f2-9abc-def0-1234-567890123456"
 
 NAMES = ("BikeTracker", "BikeTracker (Setup)")
 KEY_FILE = Path.home() / ".biketracker.key"
@@ -210,6 +213,35 @@ async def cmd_download(_args):
             print(f"WARNING: expected {expected}, decoded {len(points)}")
 
 
+async def cmd_power(_args):
+    dev = await find_device()
+    if not dev:
+        return
+    async with BleakClient(dev) as c:
+        print(f"  {await read_str(c, CHAR_PWR)}")
+        print(f"  {await read_str(c, CHAR_BATT)}")
+
+
+async def cmd_log(_args):
+    dev = await find_device()
+    if not dev:
+        return
+    lines = []
+    async with BleakClient(dev) as c:
+        while True:
+            line = await read_str(c, CHAR_LOG)
+            if line == "DONE":
+                break
+            if line:
+                lines.append(line)
+                print(f"  {line}")
+            if len(lines) > 5000:
+                break
+    out = Path.cwd() / "events.csv"
+    out.write_text("seq,wall_s,event,detail\n" + "\n".join(lines) + "\n")
+    print(f"\n{len(lines)} lines -> {out}")
+
+
 async def cmd_clear(_args):
     dev = await find_device()
     if not dev:
@@ -247,7 +279,7 @@ async def cmd_watch(_args):
 def main():
     p = argparse.ArgumentParser()
     sub = p.add_subparsers(dest="cmd", required=True)
-    for name in ("scan", "status", "pair", "download", "clear", "watch"):
+    for name in ("scan", "status", "pair", "download", "clear", "watch", "power", "log"):
         sub.add_parser(name)
     args = p.parse_args()
     try:

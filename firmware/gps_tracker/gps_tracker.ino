@@ -11,6 +11,10 @@
 #include <Preferences.h>
 #include <mbedtls/aes.h>
 #include "esp_sleep.h"
+#include "esp_attr.h"
+#include "esp_system.h"
+#include "esp_rom_crc.h"
+#include <sys/time.h>
 
 // --- Pin definitions ---
 #define GPS_RX_PIN  20
@@ -69,6 +73,28 @@
 // honouring the block after this long rather than trusting the client.
 #define MAX_CONN_SECONDS        600UL
 #define POINTS_FILE          "/points.bin"
+#define EVENT_FILE           "/events.csv"
+#define EVENT_FILE_OLD       "/events.1.csv"
+#define MAX_LOG_BYTES        24576   // ~600 lines; rotates once, so ~1200 retained
+
+// Per-state current, all bench-measured. Integer microamps: no %f on this core.
+#define I_SLEEP_UA           290UL
+#define I_IDLE_AWAKE_UA      73000UL  // awake, GPS on, BLE up
+#define I_TRACK_UA           48000UL  // awake, GPS on, BLE torn down
+#define BATTERY_UAH          2500000UL
+
+// Battery divider. D1/GPIO3 = ADC1_CH3, NOT D0/GPIO2 which is a strapping pin.
+#define HAVE_BATTERY_DIVIDER 0       // set 1 once the divider is fitted
+#define BATTERY_ADC_PIN      3
+#define BATTERY_DIVIDER_X    2
+#define BATTERY_SAMPLE_MS    30000
+#define DIVIDER_OHMS         2000000UL  // 2x 1M; bench 2x 10.2k = 20400
+#define BATTERY_CHEM_ALKALINE_3AA 0
+#define BATTERY_CHEM_LIPO_1S      1
+#define BATTERY_CHEMISTRY    BATTERY_CHEM_ALKALINE_3AA
+#define BATT_LOW_PCT         20
+#define BATT_CRIT_PCT        10
+#define BATT_RECOVER_PCT     15
 
 // --- BLE UUIDs ---
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -79,6 +105,9 @@
 #define CHAR_STATUS_UUID    "b2c3d4e5-2345-6789-abcd-ef0123456789"
 #define CHAR_STATE_UUID     "c3d4e5f6-3456-789a-bcde-f01234567890"
 #define CHAR_SEEK_UUID      "d4e5f607-4567-89ab-cdef-012345678901"
+#define CHAR_PWR_UUID       "f6a7b8c9-6789-abcd-ef01-234567890123"
+#define CHAR_LOG_UUID       "a7b8c9da-789a-bcde-f012-345678901234"
+#define CHAR_BATT_UUID      "c9dae1f2-9abc-def0-1234-567890123456"
 
 // --- GPS point storage ---
 struct GpsPoint {
@@ -174,22 +203,250 @@ void encryptBlock(const uint8_t* input, uint8_t* output, int len) {
   mbedtls_aes_free(&aes);
 }
 
+// --- Duty-cycle diagnostics ---
+// Sleep current is a bench measurement and the device cannot measure its own. What firmware
+// CAN measure, and what actually decides battery life, is the duty cycle: how often it wakes
+// and how long it stays awake. A parked bike woken 40x/day burns 40 x ~2 min at 48-73 mA,
+// and nothing logged that before.
+
+// Wall clock in microseconds. ESP-IDF keeps this running across deep sleep off the RTC
+// counter, so differences across a sleep are meaningful — unlike millis(), which restarts at
+// every wake. Verified against an external clock: 5576 s reported vs 5580 s actual.
+uint64_t wallUs() {
+  struct timeval tv;
+  gettimeofday(&tv, NULL);
+  return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+}
+
+// RTC slow memory: survives deep sleep, lost on power-cycle (rtcMagic detects that).
+#define RTC_MAGIC 0x424B5402
+RTC_DATA_ATTR uint32_t rtcMagic        = 0;
+RTC_DATA_ATTR uint32_t rtcWakeMotion   = 0;
+RTC_DATA_ATTR uint32_t rtcWakeOther    = 0;
+RTC_DATA_ATTR uint32_t rtcFalseWakes   = 0;  // woke but never reached TRACKING
+RTC_DATA_ATTR uint64_t rtcAwakeMs      = 0;
+RTC_DATA_ATTR uint64_t rtcTrackingMs   = 0;
+RTC_DATA_ATTR uint64_t rtcSleepMs      = 0;
+RTC_DATA_ATTR uint64_t rtcSleepEntryUs = 0;
+RTC_DATA_ATTR uint32_t rtcLogSeq       = 0;
+RTC_DATA_ATTR uint32_t rtcFixCount     = 0;
+RTC_DATA_ATTR uint32_t rtcNoFixCount   = 0;
+RTC_DATA_ATTR uint32_t rtcTtffSumS     = 0;
+
+uint64_t bootWallUs   = 0;
+uint64_t trackStartUs = 0;
+uint64_t lastSleptMs  = 0;
+bool trackedThisWake  = false;
+bool sessionHadFix    = false;
+bool pointsFullLogged = false;
+uint32_t brownoutCount = 0;   // NVS, not RTC: a brownout can clear the RTC domain
+uint32_t gpsPowerOnMs  = 0;   // millis() when the rail came up; 0 = off
+uint8_t  logReadStage  = 0;   // 0 = rotated file, 1 = current, 2 = done
+uint32_t logReadPos    = 0;
+
+uint64_t awakeMsNow()    { return rtcAwakeMs + (wallUs() - bootWallUs) / 1000; }
+uint64_t trackingMsNow() {
+  uint64_t t = rtcTrackingMs;
+  if (trackStartUs) t += (wallUs() - trackStartUs) / 1000;
+  return t;
+}
+
+void rotateLogIfNeeded() {
+  File f = LittleFS.open(EVENT_FILE, "r");
+  if (!f) return;
+  size_t sz = f.size();
+  f.close();
+  if (sz < MAX_LOG_BYTES) return;
+  LittleFS.remove(EVENT_FILE_OLD);
+  LittleFS.rename(EVENT_FILE, EVENT_FILE_OLD);
+}
+
+// Append one CSV line: seq,wall_s,event,detail
+// Written only on state transitions — never in the GPS/motion hot loop.
+void logEvent(const char* event, const char* detail) {
+  rotateLogIfNeeded();
+  File f = LittleFS.open(EVENT_FILE, "a");
+  if (!f) return;
+  char line[160];
+  snprintf(line, sizeof(line), "%lu,%lu,%s,%s\n",
+           (unsigned long)(++rtcLogSeq),
+           (unsigned long)(wallUs() / 1000000ULL),
+           event, detail ? detail : "");
+  f.print(line);
+  f.close();
+  Serial.print("LOG ");
+  Serial.print(line);
+}
+
+// Read the next log line across the rotated + current files. Stateless per call (reopen and
+// seek) so no file handle can be left dangling.
+bool nextLogLine(String& out) {
+  while (logReadStage < 2) {
+    const char* path = (logReadStage == 0) ? EVENT_FILE_OLD : EVENT_FILE;
+    File f = LittleFS.open(path, "r");
+    if (!f) { logReadStage++; logReadPos = 0; continue; }
+    if (logReadPos >= f.size()) {
+      f.close(); logReadStage++; logReadPos = 0; continue;
+    }
+    f.seek(logReadPos);
+    out = f.readStringUntil('\n');
+    logReadPos = f.position();
+    f.close();
+    out.trim();
+    if (out.length()) return true;
+  }
+  return false;
+}
+
+// --- Battery ---
+// Resistive divider on D1/GPIO3 (ADC1_CH3). NOT D0/GPIO2: that is a strapping pin sampled
+// at reset, and a divider holding it mid-rail risks intermittent boot failures.
+uint32_t battMv = 0;
+uint32_t battSampledAt = 0;
+bool battLow = false, battCrit = false;
+
+uint32_t batteryMv() {
+#if HAVE_BATTERY_DIVIDER
+  uint32_t now = millis();
+  if (battMv == 0 || (now - battSampledAt) > BATTERY_SAMPLE_MS) {
+    // analogReadMilliVolts applies per-chip ADC calibration; raw analogRead on the C3 is
+    // badly non-linear near the rails.
+    battMv = (uint32_t)analogReadMilliVolts(BATTERY_ADC_PIN) * BATTERY_DIVIDER_X;
+    battSampledAt = now;
+  }
+  return battMv;
+#else
+  return 0;
+#endif
+}
+
+// Crude by design: the ESP32-C3 ADC is +/-100 mV, so this is a gauge, not a measurement.
+uint8_t batteryPct(uint32_t mv) {
+  if (mv == 0) return 0;
+#if BATTERY_CHEMISTRY == BATTERY_CHEM_ALKALINE_3AA
+  // 0% is pinned at 3.4 V, not the 2.7 V cell endpoint, because the LDO drops out around
+  // there and the device browns out regardless of remaining chemistry.
+  if (mv >= 4800) return 100;
+  if (mv <= 3400) return 0;
+  if (mv >= 4500) return 90 + (mv - 4500) * 10 / 300;
+  if (mv >= 4200) return 70 + (mv - 4200) * 20 / 300;
+  if (mv >= 4000) return 50 + (mv - 4000) * 20 / 200;
+  if (mv >= 3800) return 30 + (mv - 3800) * 20 / 200;
+  if (mv >= 3600) return 15 + (mv - 3600) * 15 / 200;
+  return (mv - 3400) * 15 / 200;
+#else
+  if (mv >= 4200) return 100;
+  if (mv <= 3000) return 0;
+  if (mv >= 3900) return 70 + (mv - 3900) * 30 / 300;
+  if (mv >= 3700) return 40 + (mv - 3700) * 30 / 200;
+  if (mv >= 3400) return 10 + (mv - 3400) * 30 / 300;
+  return (mv - 3000) * 10 / 400;
+#endif
+}
+
+void updateBatteryState() {
+  uint32_t mv = batteryMv();
+  if (!mv) return;                 // no divider fitted — never act on a reading we lack
+  uint8_t pct = batteryPct(mv);
+  battLow = (pct < BATT_LOW_PCT);
+  if (!battCrit && pct < BATT_CRIT_PCT) {
+    battCrit = true;
+    char d[48];
+    snprintf(d, sizeof(d), "mv=%lu pct=%u tracking suspended", (unsigned long)mv, pct);
+    logEvent("BATTCRIT", d);
+  } else if (battCrit && pct > BATT_RECOVER_PCT) {
+    battCrit = false;
+    char d[32];
+    snprintf(d, sizeof(d), "mv=%lu pct=%u", (unsigned long)mv, pct);
+    logEvent("BATTOK", d);
+  }
+}
+
+// Average current implied by the measured duty cycle, in whole microamps.
+// Integer maths throughout: this core's newlib-nano printf has no %f and silently prints
+// nothing for it.
+uint32_t avgCurrentUa() {
+  uint64_t awake = awakeMsNow(), track = trackingMsNow(), slept = rtcSleepMs;
+  if (track > awake) track = awake;
+  uint64_t idle = awake - track, total = awake + slept;
+  if (!total) return 0;
+  uint32_t ua = (uint32_t)((idle * I_IDLE_AWAKE_UA + track * I_TRACK_UA
+                            + slept * I_SLEEP_UA) / total);
+#if HAVE_BATTERY_DIVIDER && DIVIDER_OHMS > 0
+  // Divider leakage is state-independent, so it adds rather than being weighted in.
+  uint32_t mv = batteryMv();
+  if (mv) ua += (uint32_t)((uint64_t)mv * 1000ULL / DIVIDER_OHMS);
+#endif
+  return ua;
+}
+
+void buildPowerSummary(char* out, size_t n) {
+  uint64_t awake = awakeMsNow(), track = trackingMsNow(), total = awake + rtcSleepMs;
+  uint32_t dutyBp = total ? (uint32_t)((awake * 10000ULL) / total) : 0;
+  uint32_t ua = avgCurrentUa();
+  uint32_t days = ua ? (uint32_t)((uint64_t)BATTERY_UAH / ua / 24ULL) : 0;
+  uint32_t ttffAvg = rtcFixCount ? (rtcTtffSumS / rtcFixCount) : 0;
+  uint32_t mv = batteryMv();
+
+  int w = snprintf(out, n,
+    "wake=M:%lu/O:%lu/F:%lu awake=%lus trk=%lus slp=%lus duty=%lu.%02lu%% "
+    "iavg=%lu.%03lumA proj=%lud fix=%lu/%lu ttff=%lus bor=%lu",
+    (unsigned long)rtcWakeMotion, (unsigned long)rtcWakeOther,
+    (unsigned long)rtcFalseWakes,
+    (unsigned long)(awake / 1000), (unsigned long)(track / 1000),
+    (unsigned long)(rtcSleepMs / 1000),
+    (unsigned long)(dutyBp / 100), (unsigned long)(dutyBp % 100),
+    (unsigned long)(ua / 1000), (unsigned long)(ua % 1000),
+    (unsigned long)days,
+    (unsigned long)rtcFixCount, (unsigned long)rtcNoFixCount,
+    (unsigned long)ttffAvg, (unsigned long)brownoutCount);
+
+  if (w > 0 && (size_t)w < n) {
+    snprintf(out + w, n - w, mv ? " batt=%lu.%03luV/%u%% low=%d crit=%d" : " batt=n/a",
+             (unsigned long)(mv / 1000), (unsigned long)(mv % 1000), batteryPct(mv),
+             battLow ? 1 : 0, battCrit ? 1 : 0);
+  }
+}
+
 // --- Flash storage ---
+// Layout: [int count][GpsPoint x count][uint32 crc]
+// The trailing CRC catches a brownout part-way through a write, which would otherwise leave
+// a file that loads cleanly as plausible garbage coordinates — the only previous check was
+// count > MAX_POINTS. Files written before the CRC existed have no trailing word and are
+// still accepted, so upgrading does not destroy stored points.
 void savePoints() {
   File f = LittleFS.open(POINTS_FILE, "w");
   if (!f) return;
+  size_t bytes = sizeof(GpsPoint) * pointCount;
+  uint32_t crc = esp_rom_crc32_le(0, (const uint8_t*)points, bytes);
   f.write((uint8_t*)&pointCount, sizeof(pointCount));
-  f.write((uint8_t*)points, sizeof(GpsPoint) * pointCount);
+  f.write((uint8_t*)points, bytes);
+  f.write((uint8_t*)&crc, sizeof(crc));
   f.close();
 }
 
 void loadPoints() {
+  pointCount = 0;
   File f = LittleFS.open(POINTS_FILE, "r");
-  if (!f) { pointCount = 0; return; }
-  f.read((uint8_t*)&pointCount, sizeof(pointCount));
-  if (pointCount > MAX_POINTS) pointCount = 0;
-  f.read((uint8_t*)points, sizeof(GpsPoint) * pointCount);
+  if (!f) return;
+
+  int storedCount = 0;
+  if (f.read((uint8_t*)&storedCount, sizeof(storedCount)) != (int)sizeof(storedCount) ||
+      storedCount < 0 || storedCount > MAX_POINTS) { f.close(); return; }
+
+  size_t bytes = sizeof(GpsPoint) * storedCount;
+  if (f.read((uint8_t*)points, bytes) != (int)bytes) { f.close(); return; }
+
+  uint32_t storedCrc = 0;
+  bool haveCrc = (f.read((uint8_t*)&storedCrc, sizeof(storedCrc)) == (int)sizeof(storedCrc));
   f.close();
+
+  if (haveCrc && esp_rom_crc32_le(0, (const uint8_t*)points, bytes) != storedCrc) {
+    Serial.println("points.bin CRC MISMATCH — discarding");
+    logEvent("PTSCRC", "checksum mismatch, points discarded");
+    return;
+  }
+  pointCount = storedCount;
 }
 
 void clearPoints() {
@@ -237,6 +494,22 @@ void pollFactoryReset() {
 void enterDeepSleep() {
   savePoints();
   gpsPower(false);   // cut the GPS rail: this is the 31 mA -> 0.29 mA win
+
+  // Close out this wake period before the accumulators go to RTC memory.
+  if (trackStartUs) {
+    rtcTrackingMs += (wallUs() - trackStartUs) / 1000;
+    trackStartUs = 0;
+  }
+  rtcAwakeMs += (wallUs() - bootWallUs) / 1000;
+  if (!trackedThisWake && esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+    rtcFalseWakes++;
+  }
+  char sdetail[64];
+  snprintf(sdetail, sizeof(sdetail), "awake=%lus%s",
+           (unsigned long)((wallUs() - bootWallUs) / 1000000ULL),
+           trackedThisWake ? "" : " notrack");
+  logEvent("SLEEP", sdetail);
+  rtcSleepEntryUs = wallUs();
   Serial.println(">>> Entering deep sleep. Waiting for motion interrupt.");
   Serial.flush();
 
@@ -433,6 +706,7 @@ class CountReadCallbacks : public NimBLECharacteristicCallbacks {
 void gpsPower(bool on) {
   pinMode(GPS_POWER_PIN, OUTPUT);
   digitalWrite(GPS_POWER_PIN, on ? LOW : HIGH);
+  gpsPowerOnMs = on ? millis() : 0;   // ttff is measured from rail-on, not TRACK_START
 }
 
 // GPS power is a pure function of state, driven from here so it cannot be missed on a
@@ -442,6 +716,16 @@ void setState(TrackerState newState) {
   switch (state) {
     case IDLE:
       gpsPower(false);
+      if (trackStartUs) {
+        uint64_t trkS = (wallUs() - trackStartUs) / 1000000ULL;
+        rtcTrackingMs += (wallUs() - trackStartUs) / 1000;
+        trackStartUs = 0;
+        if (!sessionHadFix) rtcNoFixCount++;
+        char d[80];
+        snprintf(d, sizeof(d), "dur=%lus pts=%d%s", (unsigned long)trkS, pointCount,
+                 sessionHadFix ? "" : " NOFIX");
+        logEvent("TRACK_STOP", d);
+      }
       startBle();                  // back up so the app can sync after the ride
       if (pStateChar) pStateChar->setValue("IDLE");
       break;
@@ -455,6 +739,13 @@ void setState(TrackerState newState) {
       break;
     case TRACKING:
       gpsPower(true);   // already on via ACQUIRING; idempotent and cheap
+      if (!trackStartUs) {
+        trackStartUs = wallUs();
+        trackedThisWake = true;
+        sessionHadFix = false;
+        pointsFullLogged = false;
+        logEvent("TRACK_START", "");
+      }
       if (pStateChar) pStateChar->setValue("TRACKING");
       break;
     case PAUSED:
@@ -482,13 +773,31 @@ float getMotion() {
 }
 
 void logPoint() {
-  if (gps.satellites.value() == 0 || !gps.location.isValid() || pointCount >= MAX_POINTS) return;
+  // Storage filling up silently loses every later ride, so say so — once per session.
+  if (pointCount >= MAX_POINTS) {
+    if (!pointsFullLogged) {
+      pointsFullLogged = true;
+      logEvent("POINTSFULL", "storage full — points discarded until cleared");
+    }
+    return;
+  }
+  if (gps.satellites.value() == 0 || !gps.location.isValid()) return;
 
   uint32_t epoch = gpsToEpoch();
   if (epoch == 0) return;  // no valid time yet
 
   points[pointCount].lat = gps.location.lat();
   points[pointCount].lng = gps.location.lng();
+  if (!sessionHadFix) {
+    sessionHadFix = true;
+    uint32_t ttff = gpsPowerOnMs ? (millis() - gpsPowerOnMs) / 1000 : 0;
+    rtcFixCount++;
+    rtcTtffSumS += ttff;
+    char d[64];
+    snprintf(d, sizeof(d), "ttff=%lus sats=%u", (unsigned long)ttff,
+             (unsigned)gps.satellites.value());
+    logEvent("FIX", d);
+  }
   points[pointCount].epoch = epoch;
   pointCount++;
 
@@ -519,6 +828,48 @@ static CountReadCallbacks  cbCount;
 static ClearCallbacks      cbClear;
 static PairCallbacks       cbPair;
 static SeekCallbacks       cbSeek;
+
+// Diagnostics characteristics. Deliberately NOT gated on pairing: they carry timings, wake
+// causes and battery state, never location — so they remain readable even without a key,
+// which matters when a key has been lost.
+class PwrReadCallbacks : public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
+    char buf[256];
+    buildPowerSummary(buf, sizeof(buf));
+    pChar->setValue(buf);
+  }
+};
+
+// One log line per read, "DONE" at the end — same paging pattern as the batch characteristic.
+class LogReadCallbacks : public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
+    String line;
+    if (nextLogLine(line)) {
+      pChar->setValue(line.c_str());
+    } else {
+      pChar->setValue("DONE");
+      logReadStage = 0;
+      logReadPos = 0;
+    }
+  }
+};
+
+// Dedicated battery characteristic so the app can warn the user without parsing the CHAR_PWR
+// diagnostic blob. avail=0 means no divider is fitted and mv/pct are meaningless.
+class BattReadCallbacks : public NimBLECharacteristicCallbacks {
+  void onRead(NimBLECharacteristic* pChar, NimBLEConnInfo& connInfo) override {
+    uint32_t mv = batteryMv();
+    char buf[80];
+    snprintf(buf, sizeof(buf), "avail=%d mv=%lu pct=%u low=%d crit=%d",
+             mv ? 1 : 0, (unsigned long)mv, batteryPct(mv),
+             battLow ? 1 : 0, battCrit ? 1 : 0);
+    pChar->setValue(buf);
+  }
+};
+
+static PwrReadCallbacks    cbPwr;
+static LogReadCallbacks    cbLog;
+static BattReadCallbacks   cbBatt;
 
 // --- BLE bring-up / tear-down ---
 // The BLE controller costs ~24 mA of the 73 mA tracking total — measured by subtraction
@@ -552,6 +903,13 @@ void startBle() {
 
   NimBLECharacteristic* pSeekChar = pService->createCharacteristic(CHAR_SEEK_UUID, NIMBLE_PROPERTY::WRITE);
   pSeekChar->setCallbacks(&cbSeek);
+
+  NimBLECharacteristic* pPwrChar = pService->createCharacteristic(CHAR_PWR_UUID, NIMBLE_PROPERTY::READ);
+  pPwrChar->setCallbacks(&cbPwr);
+  NimBLECharacteristic* pLogChar = pService->createCharacteristic(CHAR_LOG_UUID, NIMBLE_PROPERTY::READ);
+  pLogChar->setCallbacks(&cbLog);
+  NimBLECharacteristic* pBattChar = pService->createCharacteristic(CHAR_BATT_UUID, NIMBLE_PROPERTY::READ);
+  pBattChar->setCallbacks(&cbBatt);
 
   pStatusChar = pService->createCharacteristic(CHAR_STATUS_UUID, NIMBLE_PROPERTY::READ);
   pStatusChar->setValue(isPaired ? "PAIRED" : "SETUP");
@@ -599,6 +957,26 @@ void setup() {
 
   esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
 
+  // --- Duty-cycle accounting for the wake period starting now ---
+  bootWallUs = wallUs();
+  bool rtcLost = (rtcMagic != RTC_MAGIC);
+  if (rtcLost) {
+    // Power-cycle or hard reset: RTC memory is undefined, so start clean.
+    rtcMagic = RTC_MAGIC;
+    rtcWakeMotion = rtcWakeOther = rtcFalseWakes = 0;
+    rtcAwakeMs = rtcTrackingMs = rtcSleepMs = 0;
+    rtcSleepEntryUs = 0; rtcLogSeq = 0;
+    rtcFixCount = rtcNoFixCount = rtcTtffSumS = 0;
+  } else if (rtcSleepEntryUs) {
+    lastSleptMs = (bootWallUs - rtcSleepEntryUs) / 1000;
+    rtcSleepMs += lastSleptMs;
+    rtcSleepEntryUs = 0;
+  }
+  if (wakeCause == ESP_SLEEP_WAKEUP_GPIO)            rtcWakeMotion++;
+  else if (wakeCause != ESP_SLEEP_WAKEUP_UNDEFINED)  rtcWakeOther++;
+  trackedThisWake = false;
+  trackStartUs = 0;
+
   // Power the GPS rail FIRST, before Serial/LittleFS/NVS/BLE. Acquisition takes tens of
   // seconds, so overlapping it with the rest of boot is time the ride is captured rather
   // than missed.
@@ -632,6 +1010,14 @@ void setup() {
 
   prefs.begin("tracker", false);
   liveTracking = prefs.getBool("live", false);   // user preference, default off
+  // Brownouts live in NVS, not RTC memory: a brownout can clear the RTC domain and lose
+  // the very event it exists to record. BROWNOUT means the rail sagged — dying cells, or
+  // GPS turn-on inrush the supply could not hold.
+  brownoutCount = prefs.getULong("bor", 0);
+  if (esp_reset_reason() == ESP_RST_BROWNOUT) {
+    brownoutCount++;
+    prefs.putULong("bor", brownoutCount);
+  }
   isPaired = prefs.getBytesLength("key") == 16;
   if (isPaired) {
     prefs.getBytes("key", encKey, 16);
@@ -663,6 +1049,27 @@ void setup() {
   startBle();
   Serial.println("Waiting for motion...");
 
+  const char* cause =
+    wakeCause == ESP_SLEEP_WAKEUP_GPIO  ? "MOTION" :
+    wakeCause == ESP_SLEEP_WAKEUP_TIMER ? "TIMER"  :
+    wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED ? "COLD" : "OTHER";
+  esp_reset_reason_t rr = esp_reset_reason();
+  const char* rrStr =
+    rr == ESP_RST_POWERON   ? "poweron"   : rr == ESP_RST_DEEPSLEEP ? "deepsleep" :
+    rr == ESP_RST_BROWNOUT  ? "BROWNOUT"  : rr == ESP_RST_PANIC     ? "PANIC"     :
+    rr == ESP_RST_SW        ? "sw"        : "other";
+  char detail[160];
+  snprintf(detail, sizeof(detail), "%s rst=%s slept=%lus pts=%d mv=%lu%s%s",
+           cause, rrStr, (unsigned long)(lastSleptMs / 1000), pointCount,
+           (unsigned long)batteryMv(),
+           accelOk ? "" : " ACCELFAIL", rtcLost ? " rtc-reset" : "");
+  logEvent("BOOT", detail);
+
+  char summary[256];
+  buildPowerSummary(summary, sizeof(summary));
+  Serial.print("PWR ");
+  Serial.println(summary);
+
   lastMotionTime = millis();
   idleStartTime = millis();
 }
@@ -673,6 +1080,7 @@ void loop() {
   }
 
   pollFactoryReset();
+  updateBatteryState();   // cheap: batteryMv() is cached on a 30 s refresh
 
   unsigned long now = millis();
 
@@ -724,8 +1132,24 @@ void loop() {
   }
 
   switch (state) {
-    case IDLE:
-      if (wakeMoving && (now - stopTime > COOLDOWN_MS)) {
+    case IDLE: {
+      bool mayTrack = wakeMoving;
+
+      // Critical battery: keep the GPS rail off (~31.5 mA saved) to buy time for the user
+      // to sync what is already stored. BLE is untouched — suspending tracking must not
+      // cost the data it exists to protect.
+      if (battCrit) mayTrack = false;
+
+      // Buffer full: more riding cannot help. Points past MAX_POINTS are discarded anyway;
+      // this stops burning 31.5 mA to discard them.
+      if (pointCount >= MAX_POINTS) mayTrack = false;
+
+      // Unpaired: nothing can read the data, so recording is pure drain. Matters most in
+      // the shipping/retail window, where an unclaimed device would track every handling
+      // event at full power.
+      if (!isPaired) mayTrack = false;
+
+      if (mayTrack && (now - stopTime > COOLDOWN_MS)) {
         if (hasFix) {
           setState(TRACKING);
           Serial.println(">>> Motion + GPS fix — tracking");
@@ -747,6 +1171,7 @@ void loop() {
         }
       }
       break;
+    }
 
     case ACQUIRING:
       if (hasFix) {

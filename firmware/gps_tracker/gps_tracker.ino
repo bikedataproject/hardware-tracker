@@ -18,6 +18,11 @@
 #define ACCEL_SDA   6
 #define ACCEL_SCL   7
 #define ACCEL_INT1  5
+// D2 — gate of the NDS0610 P-MOSFET high-side switch on the GPS supply.
+// LOW = GPS on. HIGH, or HiZ in deep sleep, = off via the 10.2 kOhm gate pull-up.
+// Switch the HIGH side, never GND: the GPS UART would otherwise backfeed through the
+// ESP32 GPIO and keep the module partly alive.
+#define GPS_POWER_PIN 4
 #define BOOT_BUTTON 9
 
 // --- Settings ---
@@ -30,9 +35,26 @@
 #define SLEEP_DELAY_MS       120000
 #define ACCEL_ACT_THRESHOLD  20    // 20 * 62.5mg = 1.25g for ADXL345 activity interrupt
 #define RESET_HOLD_MS        5000
-#define MAX_POINTS           1000
+// 4000 points = 48 KB RAM, ~5.5 h of tracking at a 5 s interval. A single 45-min ride
+// logged 499 points, so 1000 was only ~83 min of total tracking.
+#define MAX_POINTS           4000
 #define SAVE_EVERY           10
 #define BATCH_SIZE           10
+
+// --- Power optimisation (all values measured on hardware) ---
+#define CPU_FREQ_MHZ         80      // ~halves CPU current; 80 is the floor with BLE active
+#define LOOP_DELAY_MS        10      // yield so the idle task can halt the core (WFI).
+                                     // Keep well under ~250 ms: at 9600 baud the UART ring
+                                     // buffer holds ~266 ms of NMEA.
+#define MOTION_POLL_MS       20      // 50 Hz = 2x the ADXL345 ODR. Polling AT the ODR can
+                                     // read one sample twice and skip the next as the
+                                     // clocks drift, halving sensitivity to brief peaks.
+                                     // Was one full I2C transaction per loop iteration.
+#define ADV_INTERVAL_MIN     0x320   // 800 x 0.625 ms = 500 ms
+#define ADV_INTERVAL_MAX     0x640   // 1600 x 0.625 ms = 1000 ms. Default is ~20-40 ms,
+                                     // tuned for fast discovery and costly: slowing it
+                                     // measured ~6.5 mA.
+#define GPS_RX_BUFFER        1024
 #define POINTS_FILE          "/points.bin"
 
 // --- BLE UUIDs ---
@@ -77,6 +99,7 @@ NimBLECharacteristic* pCountChar = NULL;
 NimBLECharacteristic* pStatusChar = NULL;
 NimBLECharacteristic* pStateChar = NULL;
 bool deviceConnected = false;
+bool accelOk = false;            // false => ADXL345 missing; motion wake unavailable
 
 // --- Timers ---
 unsigned long lastLogTime = 0;
@@ -179,6 +202,7 @@ void checkFactoryReset() {
 // --- Deep sleep (ADXL345 interrupt) ---
 void enterDeepSleep() {
   savePoints();
+  gpsPower(false);   // cut the GPS rail: this is the 31 mA -> 0.29 mA win
   Serial.println(">>> Entering deep sleep. Waiting for motion interrupt.");
   Serial.flush();
 
@@ -365,13 +389,37 @@ class CountReadCallbacks : public NimBLECharacteristicCallbacks {
   }
 };
 
+// GPS supply control via the D2 P-MOSFET. Cutting the rail in deep sleep took measured
+// sleep current from 31 mA to 0.29 mA — a ~107x reduction, and by far the largest single
+// power win in the design. The always-on GPS was the entire sleep floor before this.
+void gpsPower(bool on) {
+  pinMode(GPS_POWER_PIN, OUTPUT);
+  digitalWrite(GPS_POWER_PIN, on ? LOW : HIGH);
+}
+
+// GPS power is a pure function of state, driven from here so it cannot be missed on a
+// transition: IDLE is the only state where we are not trying to hold a fix.
 void setState(TrackerState newState) {
   state = newState;
   switch (state) {
-    case IDLE:      pStateChar->setValue("IDLE"); break;
-    case ACQUIRING: pStateChar->setValue("ACQUIRING"); break;
-    case TRACKING:  pStateChar->setValue("TRACKING"); break;
-    case PAUSED:    pStateChar->setValue("PAUSED"); break;
+    case IDLE:
+      gpsPower(false);
+      pStateChar->setValue("IDLE");
+      break;
+    case ACQUIRING:
+      gpsPower(true);
+      pStateChar->setValue("ACQUIRING");
+      break;
+    case TRACKING:
+      gpsPower(true);   // already on via ACQUIRING; idempotent and cheap
+      pStateChar->setValue("TRACKING");
+      break;
+    case PAUSED:
+      // Stay powered: PAUSED is a stop within a ride, and re-acquiring from cold would
+      // cost 5-41 s of TTFF producing nothing.
+      gpsPower(true);
+      pStateChar->setValue("PAUSED");
+      break;
   }
 }
 
@@ -424,13 +472,33 @@ static PairCallbacks       cbPair;
 static SeekCallbacks       cbSeek;
 
 void setup() {
+  // Before any peripheral init — changing the clock later would corrupt UART baud
+  // dividers. Roughly halves CPU current. Do NOT go below 80 MHz: the BLE controller
+  // needs the APB at 80 MHz.
+  setCpuFrequencyMhz(CPU_FREQ_MHZ);
+
+  esp_sleep_wakeup_cause_t wakeCause = esp_sleep_get_wakeup_cause();
+
+  // Power the GPS rail FIRST, before Serial/LittleFS/NVS/BLE. Acquisition takes tens of
+  // seconds, so overlapping it with the rest of boot is time the ride is captured rather
+  // than missed.
+  gpsPower(true);
+
   Serial.begin(115200);
+  // Wait for a USB-CDC host only on a COLD boot, and briefly. On battery there is no host,
+  // so a blanket wait burns its full timeout on EVERY motion wake — delaying GPS power-on
+  // for a device whose job is catching the start of a ride.
+  if (wakeCause == ESP_SLEEP_WAKEUP_UNDEFINED) {
+    while (!Serial && millis() < 600) delay(10);
+  }
+
   checkFactoryReset();
 
-  if (esp_sleep_get_wakeup_cause() == ESP_SLEEP_WAKEUP_GPIO) {
+  if (wakeCause == ESP_SLEEP_WAKEUP_GPIO) {
     Serial.println("Woke from motion interrupt");
   }
 
+  gpsSerial.setRxBufferSize(GPS_RX_BUFFER);  // must precede begin(); headroom for delay()
   gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
   Wire.begin(ACCEL_SDA, ACCEL_SCL);
 
@@ -451,11 +519,25 @@ void setup() {
     Serial.println("Device is NOT paired — waiting for setup.");
   }
 
-  if (!accel.begin()) {
-    Serial.println("No ADXL345 detected!");
-    while (1);
+  // Retry: begin() can miss on the first try straight after a hard reset while the
+  // ADXL345 is still coming up — observed repeatedly on real hardware.
+  for (int attempt = 1; attempt <= 3 && !accelOk; attempt++) {
+    accelOk = accel.begin();
+    if (!accelOk) {
+      Serial.print("ADXL345 not responding (attempt ");
+      Serial.print(attempt);
+      Serial.println("/3)");
+      delay(50);
+    }
   }
-  accel.setRange(ADXL345_RANGE_4_G);
+  if (accelOk) {
+    accel.setRange(ADXL345_RANGE_4_G);
+  } else {
+    // Previously `while(1)`, which hung BEFORE BLE init: no BLE, no sleep, ~30-80 mA until
+    // the cell was flat, and indistinguishable from a dead device except that USB stayed
+    // enumerated. Now the failure is diagnosable and the device still sleeps at the floor.
+    Serial.println("No ADXL345 detected! Motion wake unavailable — timer wake only.");
+  }
 
   const char* bleName = isPaired ? "BikeTracker" : "BikeTracker (Setup)";
   NimBLEDevice::init(bleName);
@@ -486,7 +568,13 @@ void setup() {
   pStateChar->setValue("IDLE");
 
   pService->start();
-  pServer->getAdvertising()->start();
+  NimBLEAdvertising* pAdv = pServer->getAdvertising();
+  pAdv->setMinInterval(ADV_INTERVAL_MIN);
+  pAdv->setMaxInterval(ADV_INTERVAL_MAX);
+  // Set the name explicitly: the app discovers BY NAME, so omitting it from the
+  // advertisement would be a silent, total break.
+  pAdv->setName(bleName);
+  pAdv->start();
 
   Serial.print("BLE advertising as '");
   Serial.print(bleName);
@@ -503,7 +591,17 @@ void loop() {
   }
 
   unsigned long now = millis();
-  float motion = getMotion();
+
+  // Rate-limit the accelerometer read. It was one full I2C transaction per loop iteration —
+  // thousands per second against a sensor running at 25 Hz. Same test, sampled at twice the
+  // sensor's own rate.
+  static unsigned long lastMotionPoll = 0;
+  static float motionCached = 0.0f;
+  if (now - lastMotionPoll >= MOTION_POLL_MS) {
+    motionCached = getMotion();
+    lastMotionPoll = now;
+  }
+  float motion = motionCached;
 
   bool wakeMoving = motion > WAKE_THRESHOLD;
   bool accelMoving = motion > RIDE_THRESHOLD;
@@ -584,4 +682,8 @@ void loop() {
       }
       break;
   }
+  
+  // Yield to the FreeRTOS idle task, which halts the core until the next interrupt. The
+  // loop previously spun flat out at full clock.
+  delay(LOOP_DELAY_MS);
 }

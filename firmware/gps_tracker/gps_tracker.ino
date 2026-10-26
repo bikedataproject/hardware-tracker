@@ -731,14 +731,22 @@ void setState(TrackerState newState) {
       break;
     case ACQUIRING:
       gpsPower(true);
-      if (!liveTracking) {
-        stopBle();                 // recovers the controller's ~24 mA for the whole ride
-        nextBleWindowAt = millis() + BLE_WINDOW_INTERVAL_MS;
-      }
+      // BLE deliberately stays UP here. ACQUIRING only means "something moved" — it may be
+      // a ride starting, or the device simply being handled, and there is no fix yet so
+      // nothing is being recorded. Dropping BLE at this point made the device unreachable
+      // for 30+ s after any handling, and permanently unreachable indoors where a fix never
+      // arrives. The extra ~25 mA costs ~0.2 mAh per false wake, which is nothing.
       if (pStateChar) pStateChar->setValue("ACQUIRING");
       break;
     case TRACKING:
       gpsPower(true);   // already on via ACQUIRING; idempotent and cheap
+      // Tear BLE down only now: we have a fix and are genuinely recording a ride, so the
+      // ~24 mA is worth recovering and the device is on a moving bike where nobody is
+      // trying to reach it anyway. The periodic sync window still reopens it.
+      if (!liveTracking && bleUp) {
+        stopBle();
+        nextBleWindowAt = millis() + BLE_WINDOW_INTERVAL_MS;
+      }
       if (!trackStartUs) {
         trackStartUs = wallUs();
         trackedThisWake = true;
@@ -983,6 +991,12 @@ void setup() {
   gpsPower(true);
 
   Serial.begin(115200);
+  // Never block on a serial write. USB-CDC stalls when the cable is connected but nothing
+  // is reading the port — which made every batch read take exactly 10 s, because that
+  // callback prints and the others do not. Measured: STATE/COUNT 30 ms, BATCH 10,030 ms.
+  // Output is simply dropped when no reader is attached, which is the right trade for a
+  // device that normally runs headless.
+  Serial.setTxTimeoutMs(0);
   // Wait for a USB-CDC host only on a COLD boot, and briefly. On battery there is no host,
   // so a blanket wait burns its full timeout on EVERY motion wake — delaying GPS power-on
   // for a device whose job is catching the start of a ride.
@@ -1115,7 +1129,9 @@ void loop() {
 
   // Periodic BLE sync window while riding: repeated chances for the app to find the device
   // mid-ride, rather than depending solely on the post-ride window.
-  if (!liveTracking && state != IDLE) {
+  // Only while BLE is actually torn down, i.e. in the recording states. ACQUIRING keeps BLE
+  // up so the device stays reachable when it is merely being handled.
+  if (!liveTracking && (state == TRACKING || state == PAUSED)) {
     if (!bleUp && (long)(now - nextBleWindowAt) >= 0) {
       startBle();
       bleWindowStart = now;

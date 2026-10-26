@@ -145,10 +145,6 @@ bool accelOk = false;            // false => ADXL345 missing; motion wake unavai
 NimBLEAdvertising* pAdv = NULL;
 bool bleUp = false;              // is the BLE stack currently initialised?
 
-// Keep BLE up for the whole ride so the app can show live state. Costs the full ~24 mA
-// (tracking 48 -> 73 mA), so OFF by default and treated as a user preference. Persisted in
-// NVS key "live" so the app can enable it later without a firmware change.
-bool liveTracking = false;
 unsigned long bleWindowStart  = 0;
 unsigned long nextBleWindowAt = 0;
 unsigned long bleConnectMs    = 0;  // millis() when the current connection opened
@@ -743,7 +739,11 @@ void setState(TrackerState newState) {
       // Tear BLE down only now: we have a fix and are genuinely recording a ride, so the
       // ~24 mA is worth recovering and the device is on a moving bike where nobody is
       // trying to reach it anyway. The periodic sync window still reopens it.
-      if (!liveTracking && bleUp) {
+      // Unlike the sync-window teardown below, this does not spare a connected client: a
+      // transfer in progress when the fix lands is aborted, and the app retries. Sparing it
+      // would mean a stale link holds BLE up for the whole ride, which is the 24 mA this
+      // teardown exists to recover.
+      if (bleUp) {
         stopBle();
         nextBleWindowAt = millis() + BLE_WINDOW_INTERVAL_MS;
       }
@@ -1023,7 +1023,6 @@ void setup() {
   Serial.println(" points from flash.");
 
   prefs.begin("tracker", false);
-  liveTracking = prefs.getBool("live", false);   // user preference, default off
   // Brownouts live in NVS, not RTC memory: a brownout can clear the RTC domain and lose
   // the very event it exists to record. BROWNOUT means the rail sagged — dying cells, or
   // GPS turn-on inrush the supply could not hold.
@@ -1131,7 +1130,7 @@ void loop() {
   // mid-ride, rather than depending solely on the post-ride window.
   // Only while BLE is actually torn down, i.e. in the recording states. ACQUIRING keeps BLE
   // up so the device stays reachable when it is merely being handled.
-  if (!liveTracking && (state == TRACKING || state == PAUSED)) {
+  if (state == TRACKING || state == PAUSED) {
     if (!bleUp && (long)(now - nextBleWindowAt) >= 0) {
       startBle();
       bleWindowStart = now;

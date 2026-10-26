@@ -5,3 +5,6 @@
 build/
 events.csv
 points.csv
+__pycache__/
+*.pyc
+ride.geojson
